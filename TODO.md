@@ -1,0 +1,5 @@
+- convert header to ascii art "cctv"
+- notifications
+- add to path
+- "open in vscode"
+- quickstart
