@@ -56,7 +56,7 @@ func New(cfg config.Config) Model {
 	return Model{
 		cfg:         cfg,
 		input:       ti,
-		showPreview: true,
+		showPreview: false,
 	}
 }
 
