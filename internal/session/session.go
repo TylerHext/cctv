@@ -73,6 +73,26 @@ func Kill(name string) error {
 	return nil
 }
 
+// NewWindow creates a new tmux window in the given session with a 3-pane layout:
+// one tall pane on the left, two stacked panes on the right. All panes start in workDir.
+func NewWindow(sessionName, windowName, workDir string) error {
+	target := func(pane string) string {
+		return fmt.Sprintf("%s:%s%s", sessionName, windowName, pane)
+	}
+
+	if err := exec.Command("tmux", "new-window", "-t", sessionName, "-n", windowName, "-c", workDir).Run(); err != nil {
+		return fmt.Errorf("create window %q in %q: %w", windowName, sessionName, err)
+	}
+	if err := exec.Command("tmux", "split-window", "-t", target(""), "-h", "-c", workDir).Run(); err != nil {
+		return fmt.Errorf("split horizontal: %w", err)
+	}
+	if err := exec.Command("tmux", "split-window", "-t", target(".1"), "-v", "-c", workDir).Run(); err != nil {
+		return fmt.Errorf("split vertical: %w", err)
+	}
+	_ = exec.Command("tmux", "select-pane", "-t", target(".0")).Run()
+	return nil
+}
+
 // Attach runs tmux attach-session and waits for it to exit (e.g. on detach).
 // Control returns to the caller, so cctv can restart its TUI afterward.
 func Attach(name string) error {

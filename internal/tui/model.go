@@ -2,6 +2,10 @@ package tui
 
 import (
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -15,9 +19,9 @@ import (
 
 const (
 	pollInterval   = 2 * time.Second
-	listPanelWidth = 46 // left panel width in split view
-	boxInnerWidth  = 52 // content width inside the full-view border box
-	minSplitWidth  = 110
+	listPanelWidth = 46
+	boxInnerWidth  = 52
+	maxSuggestions = 8
 )
 
 type tickMsg time.Time
@@ -33,6 +37,15 @@ const (
 	modeList mode = iota
 	modeNewInput
 	modeKillConfirm
+	modeWizard
+)
+
+type wizardStep int
+
+const (
+	wizardName wizardStep = iota
+	wizardRepos
+	wizardNotes
 )
 
 type Model struct {
@@ -44,8 +57,17 @@ type Model struct {
 	err          string
 	width        int
 	height       int
-	showPreview  bool
 	attachTarget string
+
+	// Wizard state
+	wizStep      wizardStep
+	wizSession   string
+	wizProject   string
+	wizRepos     []string
+	wizNotes     []string
+	wizAllRepos  []string
+	wizAllNotes  []string
+	wizSugCursor int
 }
 
 func New(cfg config.Config) Model {
@@ -54,9 +76,8 @@ func New(cfg config.Config) Model {
 	ti.CharLimit = 64
 
 	return Model{
-		cfg:         cfg,
-		input:       ti,
-		showPreview: false,
+		cfg:   cfg,
+		input: ti,
 	}
 }
 
@@ -109,6 +130,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateNewInput(msg)
 		case modeKillConfirm:
 			return m.updateKillConfirm(msg)
+		case modeWizard:
+			return m.updateWizard(msg)
 		}
 	}
 	return m, nil
@@ -130,7 +153,21 @@ func (m Model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "tab":
-		m.showPreview = !m.showPreview
+		if len(m.sessions) > 0 {
+			m.wizSession = m.sessions[m.cursor].Name
+			m.wizStep = wizardName
+			m.wizProject = ""
+			m.wizRepos = nil
+			m.wizNotes = nil
+			m.wizAllRepos = nil
+			m.wizAllNotes = nil
+			m.wizSugCursor = 0
+			m.mode = modeWizard
+			m.input.Reset()
+			m.input.Placeholder = "project name"
+			m.input.Focus()
+			return m, textinput.Blink
+		}
 
 	case "enter":
 		if len(m.sessions) > 0 {
@@ -196,19 +233,158 @@ func (m Model) updateKillConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// ── Wizard ───────────────────────────────────────────────────────────────────
+
+func (m Model) updateWizard(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch m.wizStep {
+	case wizardName:
+		return m.updateWizardName(msg)
+	case wizardRepos, wizardNotes:
+		return m.updateWizardPicker(msg)
+	}
+	return m, nil
+}
+
+func (m Model) updateWizardName(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		name := strings.TrimSpace(m.input.Value())
+		if name == "" {
+			m.mode = modeList
+			return m, nil
+		}
+		m.wizProject = name
+		m.wizStep = wizardRepos
+		m.wizAllRepos = scanDirs(m.cfg.ReposPath)
+		m.wizSugCursor = 0
+		m.input.Reset()
+		m.input.Placeholder = "repo name (enter to add, empty to continue)"
+		return m, nil
+	case "esc":
+		m.mode = modeList
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+func (m Model) updateWizardPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	var all, selected []string
+	if m.wizStep == wizardRepos {
+		all = m.wizAllRepos
+		selected = m.wizRepos
+	} else {
+		all = m.wizAllNotes
+		selected = m.wizNotes
+	}
+
+	suggestions := filterSuggestions(all, m.input.Value(), selected)
+
+	switch msg.String() {
+	case "enter":
+		val := strings.TrimSpace(m.input.Value())
+		if val == "" {
+			if m.wizStep == wizardRepos {
+				m.wizStep = wizardNotes
+				m.wizAllNotes = scanNotes(m.cfg.NotesPath)
+				m.wizSugCursor = 0
+				m.input.Reset()
+				m.input.Placeholder = "note path (enter to add, empty to finish)"
+			} else {
+				if err := m.executeWizard(); err != nil {
+					m.err = err.Error()
+				}
+				m.mode = modeList
+				return m, fetchSessions
+			}
+			return m, nil
+		}
+		if m.wizStep == wizardRepos {
+			m.wizRepos = append(m.wizRepos, val)
+		} else {
+			m.wizNotes = append(m.wizNotes, val)
+		}
+		m.wizSugCursor = 0
+		m.input.Reset()
+		return m, nil
+
+	case "tab":
+		if len(suggestions) > 0 {
+			idx := m.wizSugCursor
+			if idx >= len(suggestions) {
+				idx = 0
+			}
+			m.input.SetValue(suggestions[idx])
+			m.input.CursorEnd()
+		}
+		return m, nil
+
+	case "up", "ctrl+p":
+		if m.wizSugCursor > 0 {
+			m.wizSugCursor--
+		}
+		return m, nil
+
+	case "down", "ctrl+n":
+		if m.wizSugCursor < len(suggestions)-1 {
+			m.wizSugCursor++
+		}
+		return m, nil
+
+	case "esc":
+		m.mode = modeList
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	m.wizSugCursor = 0
+	return m, cmd
+}
+
+func (m Model) executeWizard() error {
+	projectDir := filepath.Join(m.cfg.WorkspacePath, m.wizProject)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		return fmt.Errorf("create project dir: %w", err)
+	}
+
+	var md strings.Builder
+	md.WriteString("# " + m.wizProject + "\n\n")
+
+	md.WriteString("## Repos\n")
+	md.WriteString("Source: " + m.cfg.ReposPath + "\n\n")
+	for _, r := range m.wizRepos {
+		md.WriteString("- " + r + "\n")
+	}
+
+	md.WriteString("\n## Notes\n")
+	md.WriteString("Source: " + m.cfg.NotesPath + "\n\n")
+	for _, n := range m.wizNotes {
+		md.WriteString("- " + n + "\n")
+	}
+
+	mdPath := filepath.Join(projectDir, "project.md")
+	if err := os.WriteFile(mdPath, []byte(md.String()), 0644); err != nil {
+		return fmt.Errorf("write project.md: %w", err)
+	}
+
+	return session.NewWindow(m.wizSession, m.wizProject, projectDir)
+}
+
 // ── View ─────────────────────────────────────────────────────────────────────
 
 func (m Model) View() string {
-	inSplit := m.showPreview && m.width >= minSplitWidth && len(m.sessions) > 0 && m.height > 0
-	if inSplit {
-		return m.splitView()
-	}
 	return m.fullView()
 }
 
-// fullView renders a centered border box with the help bar pinned to the bottom.
 func (m Model) fullView() string {
-	inner := m.renderList(boxInnerWidth)
+	var inner string
+	if m.mode == modeWizard {
+		inner = m.renderWizard(boxInnerWidth)
+	} else {
+		inner = m.renderList(boxInnerWidth)
+	}
 
 	box := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -217,24 +393,27 @@ func (m Model) fullView() string {
 		Width(boxInnerWidth).
 		Render(inner)
 
-	// Center the box horizontally.
 	centered := box
 	if m.width > 0 {
 		centered = lipgloss.PlaceHorizontal(m.width, lipgloss.Center, box)
 	}
 
-	help := helpStyle.Render("[n] new  [x] kill  [enter] attach  [j/k] nav  [tab] preview  [q] quit")
+	var helpText string
+	if m.mode == modeWizard {
+		helpText = "[tab] complete  [up/down] suggestions  [enter] add/next  [esc] cancel"
+	} else {
+		helpText = "[n] new  [x] kill  [enter] attach  [j/k] nav  [tab] project  [q] quit"
+	}
+	help := helpStyle.Render(helpText)
 
 	if m.height > 0 {
 		boxLines := strings.Count(box, "\n")
-		available := m.height - 1 // one line reserved for help
+		available := m.height - 1
 
-		// Vertically center the box.
 		if topPad := max(0, (available-boxLines)/2); topPad > 0 {
 			centered = strings.Repeat("\n", topPad) + centered
 		}
 
-		// Fill remaining space so help lands on the last row.
 		if pad := m.height - 1 - strings.Count(centered, "\n"); pad > 0 {
 			centered += strings.Repeat("\n", pad)
 		}
@@ -243,42 +422,6 @@ func (m Model) fullView() string {
 	return centered + help
 }
 
-// splitView renders a left session list + right preview pane.
-func (m Model) splitView() string {
-	previewW := m.width - listPanelWidth - 1 // 1 for separator column
-	contentH := m.height - 1                 // 1 line reserved for help bar
-
-	// Left panel
-	listContent := m.renderList(listPanelWidth)
-	leftPanel := lipgloss.NewStyle().
-		Width(listPanelWidth).
-		Height(contentH).
-		Render(listContent)
-
-	// Separator
-	sepLines := make([]string, contentH)
-	for i := range sepLines {
-		sepLines[i] = "│"
-	}
-	sep := sepStyle.Render(strings.Join(sepLines, "\n"))
-
-	// Right panel (live preview)
-	rightPanel := lipgloss.NewStyle().
-		Width(previewW).
-		Height(contentH).
-		Render(m.renderPreview(previewW, contentH))
-
-	body := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, sep, rightPanel)
-
-	help := helpStyle.Width(m.width).Render(
-		"[n] new  [x] kill  [enter] attach  [j/k] nav  [tab] hide  [q] quit",
-	)
-
-	return body + "\n" + help
-}
-
-// renderList builds the session list content (shared by both views).
-// width is used to size the column divider in the full (non-split) view.
 func (m Model) renderList(width int) string {
 	var b strings.Builder
 
@@ -288,8 +431,6 @@ func (m Model) renderList(width int) string {
 	}
 	b.WriteString(title + "\n\n")
 
-	// Layout (no dot): cursor(2) + name(22) + gap(3) + badge
-	// NAME aligns with col 2 (cursor width), STATUS aligns with col 27 (2+22+3).
 	b.WriteString(colHeaderStyle.Render("  "+fmt.Sprintf("%-25s", "NAME")+"STATUS") + "\n")
 	sepWidth := min(48, max(0, width-4))
 	b.WriteString(dividerStyle.Render("  "+strings.Repeat("─", sepWidth)) + "\n")
@@ -301,7 +442,7 @@ func (m Model) renderList(width int) string {
 	for i, s := range m.sessions {
 		cursor := "  "
 		if i == m.cursor {
-			cursor = cursorStyle.Render("▶ ")
+			cursor = cursorStyle.Render("▸ ")
 		}
 
 		nameStyle := normalNameStyle
@@ -323,7 +464,6 @@ func (m Model) renderList(width int) string {
 		b.WriteString(fmt.Sprintf("%s%s   %s\n", cursor, name, badge))
 	}
 
-	// Mode overlays sit inside the list panel in both views.
 	switch m.mode {
 	case modeNewInput:
 		b.WriteString("\n" + inputPromptStyle.Render("New session name: ") + m.input.View() + "\n")
@@ -342,58 +482,129 @@ func (m Model) renderList(width int) string {
 	return b.String()
 }
 
-// renderPreview shows the live pane output for the selected session.
-func (m Model) renderPreview(width, height int) string {
-	if len(m.sessions) == 0 || m.cursor >= len(m.sessions) {
-		return ""
-	}
-
-	s := m.sessions[m.cursor]
-
-	var badge string
-	switch s.Status {
-	case session.StateWorking:
-		badge = stateWorking.Render("◆ Working")
-	case session.StateWaiting:
-		badge = stateWaiting.Render("◉ Waiting")
-	default:
-		badge = stateIdle.Render("○ Idle")
-	}
-
-	header := previewHeaderStyle.Render(s.Name) + "  " + badge + "\n\n"
-	bodyLines := height - 3 // rows available after header (2 lines) + trailing newline
-	if bodyLines < 1 {
-		return header
-	}
-
-	raw := session.CapturePane(s.Name, bodyLines)
-	lines := strings.Split(raw, "\n")
-
-	// Strip trailing blank lines.
-	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
-		lines = lines[:len(lines)-1]
-	}
-
-	// Keep only the last bodyLines lines.
-	if len(lines) > bodyLines {
-		lines = lines[len(lines)-bodyLines:]
-	}
-
+func (m Model) renderWizard(width int) string {
 	var b strings.Builder
-	b.WriteString(header)
-	for _, line := range lines {
-		// Truncate to panel width (rune-safe).
-		runes := []rune(line)
-		if len(runes) > width-1 {
-			runes = runes[:width-1]
+
+	title := titleStyle.Render("cctv")
+	if width > 0 {
+		title = lipgloss.PlaceHorizontal(width, lipgloss.Center, title)
+	}
+	b.WriteString(title + "\n\n")
+
+	stepLabels := []string{"Name", "Repos", "Notes"}
+	step := int(m.wizStep) + 1
+	header := wizardHeaderStyle.Render(
+		fmt.Sprintf("New project in %q  (%d/3 %s)", m.wizSession, step, stepLabels[m.wizStep]),
+	)
+	b.WriteString(header + "\n\n")
+
+	switch m.wizStep {
+	case wizardName:
+		b.WriteString(inputPromptStyle.Render("Project name: ") + m.input.View() + "\n")
+
+	case wizardRepos:
+		if len(m.wizRepos) > 0 {
+			b.WriteString(wizardLabelStyle.Render("Selected repos:") + "\n")
+			for _, r := range m.wizRepos {
+				b.WriteString(wizardSelectedStyle.Render("  + "+r) + "\n")
+			}
+			b.WriteString("\n")
 		}
-		b.WriteString(previewStyle.Render(string(runes)) + "\n")
+		b.WriteString(inputPromptStyle.Render("Add repo: ") + m.input.View() + "\n")
+		suggestions := filterSuggestions(m.wizAllRepos, m.input.Value(), m.wizRepos)
+		m.renderSuggestions(&b, suggestions)
+
+	case wizardNotes:
+		if len(m.wizNotes) > 0 {
+			b.WriteString(wizardLabelStyle.Render("Selected notes:") + "\n")
+			for _, n := range m.wizNotes {
+				b.WriteString(wizardSelectedStyle.Render("  + "+n) + "\n")
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString(inputPromptStyle.Render("Add note: ") + m.input.View() + "\n")
+		suggestions := filterSuggestions(m.wizAllNotes, m.input.Value(), m.wizNotes)
+		m.renderSuggestions(&b, suggestions)
+	}
+
+	if m.err != "" {
+		b.WriteString("\n" + errorStyle.Render("error: "+m.err) + "\n")
 	}
 
 	return b.String()
 }
 
-// truncate shortens s to at most n runes.
+func (m Model) renderSuggestions(b *strings.Builder, suggestions []string) {
+	if len(suggestions) == 0 {
+		return
+	}
+	b.WriteString("\n")
+	for i, s := range suggestions {
+		if i == m.wizSugCursor {
+			b.WriteString(wizardSugHighlight.Render("  > "+s) + "\n")
+		} else {
+			b.WriteString(wizardSugStyle.Render("    "+s) + "\n")
+		}
+	}
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+func scanDirs(root string) []string {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	var dirs []string
+	for _, e := range entries {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			dirs = append(dirs, e.Name())
+		}
+	}
+	sort.Strings(dirs)
+	return dirs
+}
+
+func scanNotes(root string) []string {
+	var notes []string
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() && strings.HasPrefix(d.Name(), ".") {
+			return filepath.SkipDir
+		}
+		if !d.IsDir() && strings.HasSuffix(strings.ToLower(d.Name()), ".md") {
+			rel, _ := filepath.Rel(root, path)
+			notes = append(notes, rel)
+		}
+		return nil
+	})
+	sort.Strings(notes)
+	return notes
+}
+
+func filterSuggestions(all []string, query string, selected []string) []string {
+	query = strings.ToLower(strings.TrimSpace(query))
+	skip := make(map[string]bool, len(selected))
+	for _, s := range selected {
+		skip[s] = true
+	}
+	var out []string
+	for _, item := range all {
+		if skip[item] {
+			continue
+		}
+		if query == "" || strings.Contains(strings.ToLower(item), query) {
+			out = append(out, item)
+		}
+	}
+	if len(out) > maxSuggestions {
+		out = out[:maxSuggestions]
+	}
+	return out
+}
+
 func truncate(s string, n int) string {
 	runes := []rune(s)
 	if len(runes) <= n {
@@ -427,7 +638,6 @@ func Start(cfg config.Config) error {
 			return nil
 		}
 
-		// Attach and wait; on detach (prefix+d) the loop restarts the TUI.
 		_ = session.Attach(target)
 	}
 }

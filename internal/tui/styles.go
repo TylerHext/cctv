@@ -54,4 +54,21 @@ var (
 
 	previewStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("245"))
+
+	wizardHeaderStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("#14b8a6"))
+
+	wizardLabelStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("241"))
+
+	wizardSelectedStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#7dd3fc"))
+
+	wizardSugStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("245"))
+
+	wizardSugHighlight = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("255")).
+				Bold(true)
 )
